@@ -1,0 +1,115 @@
+blueprint:
+  name: Litter Robot Full — Flash Inovelli LED Red
+  description: >
+    When the Litter-Robot waste drawer hits 100%, flash the LED bar on one or
+    more Inovelli White Series (Matter-over-Thread, VTM31-SN) switches red for
+    a configurable duration. The switch returns to its normal LED bar state
+    automatically when the effect duration ends.
+  domain: automation
+  source_url: https://github.com/rmking42/home-automation
+  input:
+    waste_drawer_sensor:
+      name: Litter Robot waste drawer sensor
+      description: The percentage sensor exposed by the Litter Robot integration (e.g. sensor.litter_robot_waste_drawer).
+      selector:
+        entity:
+          domain: sensor
+          integration: litterrobot
+    full_threshold:
+      name: Fire when drawer is strictly above this %
+      description: >
+        HA's numeric_state "above" is exclusive — set this to 99 to fire at 100%,
+        95 to fire at 96%+, etc.
+      default: 99
+      selector:
+        number:
+          min: 50
+          max: 99
+          step: 1
+          unit_of_measurement: "%"
+    inovelli_switches:
+      name: Inovelli White Series switches
+      description: One or more VTM31-SN switches (Matter). The LED bar on each will pulse red.
+      selector:
+        device:
+          integration: matter
+          multiple: true
+    led_effect:
+      name: LED effect
+      description: >
+        Inovelli LED Effect One value. 2=fast blink, 3=slow blink, 4=pulse,
+        15=medium pulse. Pulse (4) is the most attention-grabbing without being annoying.
+      default: 4
+      selector:
+        number:
+          min: 1
+          max: 15
+          step: 1
+    led_level:
+      name: LED brightness (0–100)
+      default: 100
+      selector:
+        number:
+          min: 1
+          max: 100
+          step: 1
+    led_duration:
+      name: Effect duration (seconds)
+      description: 1–60 = seconds, 61–120 = minutes, 121–254 = hours, 255 = indefinite.
+      default: 60
+      selector:
+        number:
+          min: 1
+          max: 255
+          step: 1
+    rearm_below:
+      name: Re-arm threshold (%)
+      description: After firing, the automation will not fire again until the drawer drops below this value (e.g. after you empty it).
+      default: 50
+      selector:
+        number:
+          min: 0
+          max: 99
+          step: 1
+          unit_of_measurement: "%"
+
+mode: single
+max_exceeded: silent
+
+variables:
+  inovelli_switches: !input inovelli_switches
+  led_effect: !input led_effect
+  led_level: !input led_level
+  led_duration: !input led_duration
+  rearm_below: !input rearm_below
+  waste_drawer_sensor: !input waste_drawer_sensor
+
+trigger:
+  - platform: numeric_state
+    entity_id: !input waste_drawer_sensor
+    above: !input full_threshold
+    # `above` is exclusive in HA; using threshold-1 below would be cleaner,
+    # but `>= threshold` is achieved by setting full_threshold to e.g. 99
+    # if you want to catch 100. Default 100 fires when sensor reports >100 —
+    # adjust threshold to 99 for "fire at 100%".
+
+action:
+  - repeat:
+      for_each: "{{ inovelli_switches }}"
+      sequence:
+        - service: matter.send_command
+          data:
+            device_id: "{{ repeat.item }}"
+            endpoint_id: 1
+            cluster_id: 64561        # 0xFC31 — Inovelli manufacturer cluster
+            command_id: 1            # LED Effect One
+            command_fields:
+              "0": "{{ led_effect }}"   # Effect
+              "1": 0                    # Color: 0 = red (Inovelli hue scale, 0–255)
+              "2": "{{ led_level }}"    # Level 0–100
+              "3": "{{ led_duration }}" # Duration
+
+  # Block re-firing until the drawer is emptied.
+  - wait_template: >
+      {{ states(waste_drawer_sensor) | float(0) < rearm_below }}
+    continue_on_timeout: false
