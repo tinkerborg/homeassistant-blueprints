@@ -1,21 +1,28 @@
 blueprint:
-  name: Litter Robot Full — Blink Inovelli LED Red (continuous)
+  name: Litter Robot Alerts — Inovelli LED
   description: >
-    While the Litter-Robot waste drawer is above the "start" threshold, blink
-    the LED bar red on one or more Inovelli White Series 2-1 (VTM31-SN, Matter)
-    switches. When the drawer drops below the "stop" threshold, clear the
-    effect and the LED bar returns to its normal load-level indicator.
+    Show alerts on one or more Inovelli White Series 2-1 (VTM31-SN, Matter)
+    switches based on Litter-Robot state:
+      * Drawer-full alert: waste drawer is above the "full" threshold.
+      * Error alert: status sensor matches one of the configured error states
+        (e.g. "Cycle Interrupted" when stuck mid-cycle).
+
+
+    Each alert has its own selectable color and effect type. When neither
+    condition is active, the LED bar returns to its normal load-level
+    indicator.
+
+
+    Priority: drawer-full takes precedence over error.
 
 
     Reconciliation:
-      * Blinks start when the drawer crosses above the start threshold.
-      * Blinks stop when the drawer falls below the stop threshold.
-      * On Home Assistant restart, the current sensor value is re-evaluated
-        and the blink is started or cleared as appropriate.
-      * When you first save this automation, the existing drawer state isn't
-        evaluated automatically — run it once from the automation page
-        ("Run actions") to apply the current state. After that, the triggers
-        keep it in sync.
+      * Drawer alert toggles on the start/stop thresholds (hysteresis).
+      * Error alert follows the status sensor directly.
+      * On HA restart, the current sensor values are re-evaluated and the LED
+        is set accordingly.
+      * When you first save this automation, run it once from the automation
+        page ("Run actions") to apply the current state.
 
 
     Requires VTM31-SN firmware 1.1.0 or later (effect select entity must exist).
@@ -31,7 +38,7 @@ blueprint:
           domain: sensor
           integration: litterrobot
     full_threshold:
-      name: Start blinking when above this %
+      name: Start drawer-full alert when above this %
       description: >
         Home Assistant's numeric_state "above" is exclusive — set this to 99
         to start at 100%, 89 to start at 90%+, etc.
@@ -43,8 +50,8 @@ blueprint:
           step: 1
           unit_of_measurement: "%"
     stop_threshold:
-      name: Stop blinking when below this %
-      description: Drawer must drop strictly below this value for the blink to clear.
+      name: Stop drawer-full alert when below this %
+      description: Drawer must drop strictly below this value for the alert to clear.
       default: 50
       selector:
         number:
@@ -52,17 +59,14 @@ blueprint:
           max: 99
           step: 1
           unit_of_measurement: "%"
-    inovelli_devices:
-      name: Inovelli VTM31-SN switches
-      description: >
-        Pick one or more White Series 2-1 switches. Only select VTM31-SN
-        devices — the picker also shows other Matter devices.
+    full_color:
+      name: Drawer-full color
+      description: LED color while the drawer-full alert is active.
+      default: [255, 0, 0]
       selector:
-        device:
-          integration: matter
-          multiple: true
-    effect_type:
-      name: Effect type
+        color_rgb:
+    full_effect_type:
+      name: Drawer-full effect type
       description: Which animation the LED bar runs while the drawer is full.
       default: Fast Blink
       selector:
@@ -79,6 +83,49 @@ blueprint:
             - Slow Siren
             - Open Close
             - Small To Big
+    robot_vacuum:
+      name: Litter Robot vacuum entity
+      description: >
+        The vacuum entity created by the Litter Robot integration. Its state
+        becomes "error" for any error condition (stuck mid-cycle, cat sensor
+        fault, etc.) — used as a generic error signal.
+      selector:
+        entity:
+          domain: vacuum
+          integration: litterrobot
+    error_color:
+      name: Error color
+      description: LED color while the error alert is active.
+      default: [255, 128, 0]
+      selector:
+        color_rgb:
+    error_effect_type:
+      name: Error effect type
+      description: Which animation the LED bar runs while the robot is in an error state.
+      default: Slow Blink
+      selector:
+        select:
+          options:
+            - Solid
+            - Fast Blink
+            - Middle Blink
+            - Slow Blink
+            - Fast Chase
+            - Middle Chase
+            - Slow Chase
+            - Fast Siren
+            - Slow Siren
+            - Open Close
+            - Small To Big
+    inovelli_devices:
+      name: Inovelli VTM31-SN switches
+      description: >
+        Pick one or more White Series 2-1 switches. Only select VTM31-SN
+        devices — the picker also shows other Matter devices.
+      selector:
+        device:
+          integration: matter
+          multiple: true
     brightness_pct:
       name: LED brightness (%)
       default: 80
@@ -101,13 +148,25 @@ trigger:
     entity_id: !input waste_drawer_sensor
     below: !input stop_threshold
     id: drawer_emptied
+  - platform: state
+    entity_id: !input robot_vacuum
+    id: vacuum_state_changed
   - platform: homeassistant
     event: start
 
 variables:
+  waste_drawer_sensor: !input waste_drawer_sensor
+  full_threshold: !input full_threshold
+  stop_threshold: !input stop_threshold
+  robot_vacuum: !input robot_vacuum
   inovelli_devices: !input inovelli_devices
-  effect_type: !input effect_type
+  full_color: !input full_color
+  full_effect_type: !input full_effect_type
+  error_color: !input error_color
+  error_effect_type: !input error_effect_type
   brightness_pct: !input brightness_pct
+  current_drawer: "{{ states(waste_drawer_sensor) | float(0) }}"
+  is_vacuum_error: "{{ states(robot_vacuum) == 'error' }}"
   effect_color_lights: >-
     {% set out = namespace(items=[]) %}
     {% for d in inovelli_devices %}
@@ -136,7 +195,7 @@ variables:
 
 action:
   - choose:
-      # Drawer crossed the start threshold — start the blink.
+      # Drawer crossed the start threshold — show drawer-full alert.
       - conditions:
           - condition: trigger
             id: drawer_full
@@ -148,34 +207,89 @@ action:
                   data:
                     entity_id: "{{ repeat.item }}"
                     brightness_pct: "{{ brightness_pct }}"
-                    hs_color: [0, 100]
+                    rgb_color: "{{ full_color }}"
           - repeat:
               for_each: "{{ effect_selects }}"
               sequence:
                 - service: select.select_option
                   data:
                     entity_id: "{{ repeat.item }}"
-                    option: "{{ effect_type }}"
+                    option: "{{ full_effect_type }}"
 
-      # Drawer dropped below the stop threshold — clear the effect.
+      # Drawer dropped below the stop threshold — fall back to error alert or clear.
       - conditions:
           - condition: trigger
             id: drawer_emptied
         sequence:
-          - repeat:
-              for_each: "{{ effect_color_lights }}"
-              sequence:
-                - service: light.turn_off
-                  data:
-                    entity_id: "{{ repeat.item }}"
+          - choose:
+              - conditions: "{{ is_vacuum_error }}"
+                sequence:
+                  - repeat:
+                      for_each: "{{ effect_color_lights }}"
+                      sequence:
+                        - service: light.turn_on
+                          data:
+                            entity_id: "{{ repeat.item }}"
+                            brightness_pct: "{{ brightness_pct }}"
+                            rgb_color: "{{ error_color }}"
+                  - repeat:
+                      for_each: "{{ effect_selects }}"
+                      sequence:
+                        - service: select.select_option
+                          data:
+                            entity_id: "{{ repeat.item }}"
+                            option: "{{ error_effect_type }}"
+            default:
+              - repeat:
+                  for_each: "{{ effect_color_lights }}"
+                  sequence:
+                    - service: light.turn_off
+                      data:
+                        entity_id: "{{ repeat.item }}"
 
-    # HA start or manual "Run actions" — reconcile based on current sensor value.
+      # Vacuum state changed — apply error alert unless drawer-full is active.
+      - conditions:
+          - condition: trigger
+            id: vacuum_state_changed
+        sequence:
+          - choose:
+              # Drawer-full has priority — don't override.
+              - conditions: "{{ current_drawer > full_threshold }}"
+                sequence: []
+              # Vacuum is now in error — show error alert.
+              - conditions: "{{ is_vacuum_error }}"
+                sequence:
+                  - repeat:
+                      for_each: "{{ effect_color_lights }}"
+                      sequence:
+                        - service: light.turn_on
+                          data:
+                            entity_id: "{{ repeat.item }}"
+                            brightness_pct: "{{ brightness_pct }}"
+                            rgb_color: "{{ error_color }}"
+                  - repeat:
+                      for_each: "{{ effect_selects }}"
+                      sequence:
+                        - service: select.select_option
+                          data:
+                            entity_id: "{{ repeat.item }}"
+                            option: "{{ error_effect_type }}"
+              # Vacuum cleared an error and drawer isn't full — turn off.
+              - conditions:
+                  - "{{ trigger.from_state is not none }}"
+                  - "{{ trigger.from_state.state == 'error' }}"
+                sequence:
+                  - repeat:
+                      for_each: "{{ effect_color_lights }}"
+                      sequence:
+                        - service: light.turn_off
+                          data:
+                            entity_id: "{{ repeat.item }}"
+
+    # HA start or manual "Run actions" — reconcile from current sensor values.
     default:
       - choose:
-          - conditions:
-              - condition: numeric_state
-                entity_id: !input waste_drawer_sensor
-                above: !input full_threshold
+          - conditions: "{{ current_drawer > full_threshold }}"
             sequence:
               - repeat:
                   for_each: "{{ effect_color_lights }}"
@@ -184,18 +298,32 @@ action:
                       data:
                         entity_id: "{{ repeat.item }}"
                         brightness_pct: "{{ brightness_pct }}"
-                        hs_color: [0, 100]
+                        rgb_color: "{{ full_color }}"
               - repeat:
                   for_each: "{{ effect_selects }}"
                   sequence:
                     - service: select.select_option
                       data:
                         entity_id: "{{ repeat.item }}"
-                        option: "{{ effect_type }}"
-          - conditions:
-              - condition: numeric_state
-                entity_id: !input waste_drawer_sensor
-                below: !input stop_threshold
+                        option: "{{ full_effect_type }}"
+          - conditions: "{{ is_vacuum_error }}"
+            sequence:
+              - repeat:
+                  for_each: "{{ effect_color_lights }}"
+                  sequence:
+                    - service: light.turn_on
+                      data:
+                        entity_id: "{{ repeat.item }}"
+                        brightness_pct: "{{ brightness_pct }}"
+                        rgb_color: "{{ error_color }}"
+              - repeat:
+                  for_each: "{{ effect_selects }}"
+                  sequence:
+                    - service: select.select_option
+                      data:
+                        entity_id: "{{ repeat.item }}"
+                        option: "{{ error_effect_type }}"
+          - conditions: "{{ current_drawer < stop_threshold }}"
             sequence:
               - repeat:
                   for_each: "{{ effect_color_lights }}"
