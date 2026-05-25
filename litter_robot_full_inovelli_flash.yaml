@@ -1,15 +1,24 @@
 blueprint:
-  name: Litter Robot Full — Flash Inovelli LED Red
+  name: Litter Robot Full — Blink Inovelli LED Red (continuous)
   description: >
-    When the Litter-Robot waste drawer reaches the threshold, flash the LED bar
-    red on one or more Inovelli White Series 2-1 (VTM31-SN, Matter-over-Thread)
-    switches, then clear the effect. The LED bar returns to its normal "load
-    level" behaviour automatically when the effect is cleared.
+    While the Litter-Robot waste drawer is above the "start" threshold, blink
+    the LED bar red on one or more Inovelli White Series 2-1 (VTM31-SN, Matter)
+    switches. When the drawer drops below the "stop" threshold, clear the
+    effect and the LED bar returns to its normal load-level indicator.
 
 
-    Requires VTM31-SN firmware 1.1.0 or later. No add-ons or custom scripts are
-    needed — this drives the standard light + select entities that the Matter
-    integration already exposes for each switch.
+    Reconciliation:
+      * Blinks start when the drawer crosses above the start threshold.
+      * Blinks stop when the drawer falls below the stop threshold.
+      * On Home Assistant restart, the current sensor value is re-evaluated
+        and the blink is started or cleared as appropriate.
+      * When you first save this automation, the existing drawer state isn't
+        evaluated automatically — run it once from the automation page
+        ("Run actions") to apply the current state. After that, the triggers
+        keep it in sync.
+
+
+    Requires VTM31-SN firmware 1.1.0 or later (effect select entity must exist).
   domain: automation
   homeassistant:
     min_version: 2024.6.0
@@ -22,10 +31,10 @@ blueprint:
           domain: sensor
           integration: litterrobot
     full_threshold:
-      name: Fire when above this %
+      name: Start blinking when above this %
       description: >
-        Home Assistant's numeric_state "above" is exclusive. Set this to 99 to
-        fire at 100%, 89 to fire at 90%+, etc.
+        Home Assistant's numeric_state "above" is exclusive — set this to 99
+        to start at 100%, 89 to start at 90%+, etc.
       default: 99
       selector:
         number:
@@ -33,18 +42,28 @@ blueprint:
           max: 99
           step: 1
           unit_of_measurement: "%"
+    stop_threshold:
+      name: Stop blinking when below this %
+      description: Drawer must drop strictly below this value for the blink to clear.
+      default: 50
+      selector:
+        number:
+          min: 0
+          max: 99
+          step: 1
+          unit_of_measurement: "%"
     inovelli_devices:
       name: Inovelli VTM31-SN switches
       description: >
-        Pick one or more White Series 2-1 switches. Only select VTM31-SN devices
-        — the picker also shows other Matter devices.
+        Pick one or more White Series 2-1 switches. Only select VTM31-SN
+        devices — the picker also shows other Matter devices.
       selector:
         device:
           integration: matter
           multiple: true
     effect_type:
       name: Effect type
-      description: Which animation the LED bar runs while flashing.
+      description: Which animation the LED bar runs while the drawer is full.
       default: Fast Blink
       selector:
         select:
@@ -69,47 +88,26 @@ blueprint:
           max: 100
           step: 1
           unit_of_measurement: "%"
-    flash_duration:
-      name: Flash duration (seconds)
-      description: How long to keep flashing before clearing the effect.
-      default: 60
-      selector:
-        number:
-          min: 5
-          max: 3600
-          step: 5
-          unit_of_measurement: seconds
-    rearm_below:
-      name: Re-arm threshold (%)
-      description: >
-        After firing, the automation will not fire again until the drawer drops
-        below this value (i.e. you've emptied it).
-      default: 50
-      selector:
-        number:
-          min: 0
-          max: 99
-          step: 1
-          unit_of_measurement: "%"
 
-mode: single
+mode: restart
 max_exceeded: silent
 
 trigger:
   - platform: numeric_state
     entity_id: !input waste_drawer_sensor
     above: !input full_threshold
+    id: drawer_full
+  - platform: numeric_state
+    entity_id: !input waste_drawer_sensor
+    below: !input stop_threshold
+    id: drawer_emptied
+  - platform: homeassistant
+    event: start
 
 variables:
   inovelli_devices: !input inovelli_devices
   effect_type: !input effect_type
   brightness_pct: !input brightness_pct
-  rearm_below: !input rearm_below
-  waste_drawer_sensor: !input waste_drawer_sensor
-  # For each selected device, find the LED-bar light entity (the one with
-  # color support) and the effect select entity (the one that has "Solid" as
-  # an option). These are the two entities the Matter integration exposes on
-  # VTM31-SN FW 1.1.0+ for LED-bar effect control.
   effect_color_lights: >-
     {% set out = namespace(items=[]) %}
     {% for d in inovelli_devices %}
@@ -126,9 +124,10 @@ variables:
     {% set out = namespace(items=[]) %}
     {% for d in inovelli_devices %}
       {% for ent in device_entities(d) %}
+        {% set opts = state_attr(ent, 'options') or [] %}
         {% if ent.startswith('select.')
               and ent in integration_entities('matter')
-              and 'Solid' in (state_attr(ent, 'options') or []) %}
+              and 'solid' in (opts | map('lower') | list) %}
           {% set out.items = out.items + [ent] %}
         {% endif %}
       {% endfor %}
@@ -136,39 +135,71 @@ variables:
     {{ out.items }}
 
 action:
-  # Set red colour + brightness on every LED-bar light.
-  - repeat:
-      for_each: "{{ effect_color_lights }}"
-      sequence:
-        - service: light.turn_on
-          target:
-            entity_id: "{{ repeat.item }}"
-          data:
-            brightness_pct: "{{ brightness_pct }}"
-            hs_color: [0, 100]
+  - choose:
+      # Drawer crossed the start threshold — start the blink.
+      - conditions:
+          - condition: trigger
+            id: drawer_full
+        sequence:
+          - repeat:
+              for_each: "{{ effect_color_lights }}"
+              sequence:
+                - service: light.turn_on
+                  data:
+                    entity_id: "{{ repeat.item }}"
+                    brightness_pct: "{{ brightness_pct }}"
+                    hs_color: [0, 100]
+          - repeat:
+              for_each: "{{ effect_selects }}"
+              sequence:
+                - service: select.select_option
+                  data:
+                    entity_id: "{{ repeat.item }}"
+                    option: "{{ effect_type }}"
 
-  # Kick off the effect on every effect-select entity.
-  - repeat:
-      for_each: "{{ effect_selects }}"
-      sequence:
-        - service: select.select_option
-          target:
-            entity_id: "{{ repeat.item }}"
-          data:
-            option: "{{ effect_type }}"
+      # Drawer dropped below the stop threshold — clear the effect.
+      - conditions:
+          - condition: trigger
+            id: drawer_emptied
+        sequence:
+          - repeat:
+              for_each: "{{ effect_color_lights }}"
+              sequence:
+                - service: light.turn_off
+                  data:
+                    entity_id: "{{ repeat.item }}"
 
-  - delay:
-      seconds: !input flash_duration
-
-  # Turning off the LED-bar light clears the effect and lets the switch resume
-  # its normal load-level indicator behaviour.
-  - repeat:
-      for_each: "{{ effect_color_lights }}"
-      sequence:
-        - service: light.turn_off
-          target:
-            entity_id: "{{ repeat.item }}"
-
-  # Block re-firing until the drawer is emptied.
-  - wait_template: "{{ states(waste_drawer_sensor) | float(0) < rearm_below }}"
-    continue_on_timeout: false
+    # HA start or manual "Run actions" — reconcile based on current sensor value.
+    default:
+      - choose:
+          - conditions:
+              - condition: numeric_state
+                entity_id: !input waste_drawer_sensor
+                above: !input full_threshold
+            sequence:
+              - repeat:
+                  for_each: "{{ effect_color_lights }}"
+                  sequence:
+                    - service: light.turn_on
+                      data:
+                        entity_id: "{{ repeat.item }}"
+                        brightness_pct: "{{ brightness_pct }}"
+                        hs_color: [0, 100]
+              - repeat:
+                  for_each: "{{ effect_selects }}"
+                  sequence:
+                    - service: select.select_option
+                      data:
+                        entity_id: "{{ repeat.item }}"
+                        option: "{{ effect_type }}"
+          - conditions:
+              - condition: numeric_state
+                entity_id: !input waste_drawer_sensor
+                below: !input stop_threshold
+            sequence:
+              - repeat:
+                  for_each: "{{ effect_color_lights }}"
+                  sequence:
+                    - service: light.turn_off
+                      data:
+                        entity_id: "{{ repeat.item }}"
