@@ -1,25 +1,31 @@
 blueprint:
   name: Litter Robot Full — Flash Inovelli LED Red
   description: >
-    When the Litter-Robot waste drawer hits 100%, flash the LED bar on one or
-    more Inovelli White Series (Matter-over-Thread, VTM31-SN) switches red for
-    a configurable duration. The switch returns to its normal LED bar state
-    automatically when the effect duration ends.
+    When the Litter-Robot waste drawer reaches the threshold, flash the LED bar
+    red on one or more Inovelli White Series 2-1 (VTM31-SN, Matter-over-Thread)
+    switches, then clear the effect. The LED bar returns to its normal "load
+    level" behaviour automatically when the effect is cleared.
+
+
+    Requires VTM31-SN firmware 1.1.0 or later. No add-ons or custom scripts are
+    needed — this drives the standard light + select entities that the Matter
+    integration already exposes for each switch.
   domain: automation
-  source_url: https://github.com/rmking42/home-automation
+  homeassistant:
+    min_version: 2024.6.0
   input:
     waste_drawer_sensor:
-      name: Litter Robot waste drawer sensor
-      description: The percentage sensor exposed by the Litter Robot integration (e.g. sensor.litter_robot_waste_drawer).
+      name: Litter Robot waste-drawer sensor
+      description: The % sensor exposed by the Litter Robot integration.
       selector:
         entity:
           domain: sensor
           integration: litterrobot
     full_threshold:
-      name: Fire when drawer is strictly above this %
+      name: Fire when above this %
       description: >
-        HA's numeric_state "above" is exclusive — set this to 99 to fire at 100%,
-        95 to fire at 96%+, etc.
+        Home Assistant's numeric_state "above" is exclusive. Set this to 99 to
+        fire at 100%, 89 to fire at 90%+, etc.
       default: 99
       selector:
         number:
@@ -27,44 +33,57 @@ blueprint:
           max: 99
           step: 1
           unit_of_measurement: "%"
-    inovelli_switches:
-      name: Inovelli White Series switches
-      description: One or more VTM31-SN switches (Matter). The LED bar on each will pulse red.
+    inovelli_devices:
+      name: Inovelli VTM31-SN switches
+      description: >
+        Pick one or more White Series 2-1 switches. Only select VTM31-SN devices
+        — the picker also shows other Matter devices.
       selector:
         device:
           integration: matter
           multiple: true
-    led_effect:
-      name: LED effect
-      description: >
-        Inovelli LED Effect One value. 2=fast blink, 3=slow blink, 4=pulse,
-        15=medium pulse. Pulse (4) is the most attention-grabbing without being annoying.
-      default: 4
+    effect_type:
+      name: Effect type
+      description: Which animation the LED bar runs while flashing.
+      default: Fast Blink
       selector:
-        number:
-          min: 1
-          max: 15
-          step: 1
-    led_level:
-      name: LED brightness (0–100)
-      default: 100
+        select:
+          options:
+            - Solid
+            - Fast Blink
+            - Middle Blink
+            - Slow Blink
+            - Fast Chase
+            - Middle Chase
+            - Slow Chase
+            - Fast Siren
+            - Slow Siren
+            - Open Close
+            - Small To Big
+    brightness_pct:
+      name: LED brightness (%)
+      default: 80
       selector:
         number:
           min: 1
           max: 100
           step: 1
-    led_duration:
-      name: Effect duration (seconds)
-      description: 1–60 = seconds, 61–120 = minutes, 121–254 = hours, 255 = indefinite.
+          unit_of_measurement: "%"
+    flash_duration:
+      name: Flash duration (seconds)
+      description: How long to keep flashing before clearing the effect.
       default: 60
       selector:
         number:
-          min: 1
-          max: 255
-          step: 1
+          min: 5
+          max: 3600
+          step: 5
+          unit_of_measurement: seconds
     rearm_below:
       name: Re-arm threshold (%)
-      description: After firing, the automation will not fire again until the drawer drops below this value (e.g. after you empty it).
+      description: >
+        After firing, the automation will not fire again until the drawer drops
+        below this value (i.e. you've emptied it).
       default: 50
       selector:
         number:
@@ -76,40 +95,80 @@ blueprint:
 mode: single
 max_exceeded: silent
 
-variables:
-  inovelli_switches: !input inovelli_switches
-  led_effect: !input led_effect
-  led_level: !input led_level
-  led_duration: !input led_duration
-  rearm_below: !input rearm_below
-  waste_drawer_sensor: !input waste_drawer_sensor
-
 trigger:
   - platform: numeric_state
     entity_id: !input waste_drawer_sensor
     above: !input full_threshold
-    # `above` is exclusive in HA; using threshold-1 below would be cleaner,
-    # but `>= threshold` is achieved by setting full_threshold to e.g. 99
-    # if you want to catch 100. Default 100 fires when sensor reports >100 —
-    # adjust threshold to 99 for "fire at 100%".
+
+variables:
+  inovelli_devices: !input inovelli_devices
+  effect_type: !input effect_type
+  brightness_pct: !input brightness_pct
+  rearm_below: !input rearm_below
+  waste_drawer_sensor: !input waste_drawer_sensor
+  # For each selected device, find the LED-bar light entity (the one with
+  # color support) and the effect select entity (the one that has "Solid" as
+  # an option). These are the two entities the Matter integration exposes on
+  # VTM31-SN FW 1.1.0+ for LED-bar effect control.
+  effect_color_lights: >-
+    {% set out = namespace(items=[]) %}
+    {% for d in inovelli_devices %}
+      {% for ent in device_entities(d) %}
+        {% if ent.startswith('light.')
+              and ent in integration_entities('matter')
+              and 'color_temp' in (state_attr(ent, 'supported_color_modes') or []) %}
+          {% set out.items = out.items + [ent] %}
+        {% endif %}
+      {% endfor %}
+    {% endfor %}
+    {{ out.items }}
+  effect_selects: >-
+    {% set out = namespace(items=[]) %}
+    {% for d in inovelli_devices %}
+      {% for ent in device_entities(d) %}
+        {% if ent.startswith('select.')
+              and ent in integration_entities('matter')
+              and 'Solid' in (state_attr(ent, 'options') or []) %}
+          {% set out.items = out.items + [ent] %}
+        {% endif %}
+      {% endfor %}
+    {% endfor %}
+    {{ out.items }}
 
 action:
+  # Set red colour + brightness on every LED-bar light.
   - repeat:
-      for_each: "{{ inovelli_switches }}"
+      for_each: "{{ effect_color_lights }}"
       sequence:
-        - service: matter.send_command
+        - service: light.turn_on
+          target:
+            entity_id: "{{ repeat.item }}"
           data:
-            device_id: "{{ repeat.item }}"
-            endpoint_id: 1
-            cluster_id: 64561        # 0xFC31 — Inovelli manufacturer cluster
-            command_id: 1            # LED Effect One
-            command_fields:
-              "0": "{{ led_effect }}"   # Effect
-              "1": 0                    # Color: 0 = red (Inovelli hue scale, 0–255)
-              "2": "{{ led_level }}"    # Level 0–100
-              "3": "{{ led_duration }}" # Duration
+            brightness_pct: "{{ brightness_pct }}"
+            hs_color: [0, 100]
+
+  # Kick off the effect on every effect-select entity.
+  - repeat:
+      for_each: "{{ effect_selects }}"
+      sequence:
+        - service: select.select_option
+          target:
+            entity_id: "{{ repeat.item }}"
+          data:
+            option: "{{ effect_type }}"
+
+  - delay:
+      seconds: !input flash_duration
+
+  # Turning off the LED-bar light clears the effect and lets the switch resume
+  # its normal load-level indicator behaviour.
+  - repeat:
+      for_each: "{{ effect_color_lights }}"
+      sequence:
+        - service: light.turn_off
+          target:
+            entity_id: "{{ repeat.item }}"
 
   # Block re-firing until the drawer is emptied.
-  - wait_template: >
-      {{ states(waste_drawer_sensor) | float(0) < rearm_below }}
+  - wait_template: "{{ states(waste_drawer_sensor) | float(0) < rearm_below }}"
     continue_on_timeout: false
