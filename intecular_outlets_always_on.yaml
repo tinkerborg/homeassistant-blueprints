@@ -1,0 +1,55 @@
+blueprint:
+  name: Intecular Outlets — Always On
+  description: >
+    Keeps every Intecular IVO1 outlet (MQTT) turned on. Auto-discovers them
+    by integration (MQTT) + manufacturer (Intecular) + entity domain
+    (switch.*), so there is nothing to pick — newly added outlets are
+    covered automatically. Nightlight (light.*) entities on the same
+    devices are ignored.
+
+
+    Fires whenever any matching outlet reports "off", and on HA start.
+  domain: automation
+  homeassistant:
+    min_version: 2024.6.0
+  input: {}
+
+mode: single
+max_exceeded: silent
+
+variables:
+  always_on_outlets: >-
+    {% set ns = namespace(items=[]) %}
+    {% for ent in integration_entities('mqtt') %}
+      {% if ent.startswith('switch.') %}
+        {% set dev = device_id(ent) %}
+        {% if dev and (device_attr(dev, 'manufacturer') or '') | lower == 'intecular' %}
+          {% set ns.items = ns.items + [ent] %}
+        {% endif %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.items }}
+
+trigger:
+  - platform: template
+    value_template: >-
+      {% set ns = namespace(items=[]) %}
+      {% for ent in integration_entities('mqtt') %}
+        {% if ent.startswith('switch.') %}
+          {% set dev = device_id(ent) %}
+          {% if dev and (device_attr(dev, 'manufacturer') or '') | lower == 'intecular' %}
+            {% set ns.items = ns.items + [ent] %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.items | select('is_state', 'off') | list | count > 0 }}
+  - platform: homeassistant
+    event: start
+
+action:
+  - repeat:
+      for_each: "{{ always_on_outlets | select('is_state', 'off') | list }}"
+      sequence:
+        - service: switch.turn_on
+          data:
+            entity_id: "{{ repeat.item }}"
